@@ -1,24 +1,35 @@
-# 1.导入需要的库
-
+import os
+from pathlib import Path
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
-from pathlib import Path
+from torch.utils.data import TensorDataset, DataLoader
 
-# 2.设置随机种子
+# 1. 基本设置
 
 SEED = 42
 torch.manual_seed(SEED)
 
-# 3.读取数据
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-df = pd.read_csv("train.csv")
+DATA_PATH = BASE_DIR / "src" / "train.csv"
 
-# 4.特征工程
+MODEL_PATH = BASE_DIR / "src" / "titanic_model_best.pth"
 
-# 从 Cabin 中提取 Deck
+DOCS_DIR = BASE_DIR / "docs"
+DOCS_DIR.mkdir(exist_ok=True)
+
+# 2. 读取数据
+
+df = pd.read_csv(DATA_PATH)
+
+print("数据读取成功！")
+print(f"数据集大小：{df.shape}")
+
+# 3. 特征工程
+
+# 从 Cabin 中提取船舱甲板信息
 df["Deck"] = df["Cabin"].str[0]
 df["Deck"] = df["Deck"].fillna("Unknown")
 
@@ -28,81 +39,107 @@ df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
 # 是否独自一人
 df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
 
-# 从 Name 中提取称呼
+# 从姓名中提取称呼
 df["Title"] = df["Name"].str.extract(r",\s*([^.]*)\.")
 
-# 每个人对应的票价
+# 每个人承担的船票费用
 df["FarePerPerson"] = df["Fare"] / df["FamilySize"]
 
-# 5.划分训练集和测试集
+# 4. 分离标签和特征
 
-# 取出标签
 y = df["Survived"]
-
-# 删除标签，得到特征
 X = df.drop(columns=["Survived"])
 
-# 随机打乱数据下标
+# 5. 划分训练集、验证集、测试集
+
 indices = torch.randperm(len(df))
 
-# 80%作为训练集
-train_size = int(len(df) * 0.8)
+train_size = int(len(df) * 0.64)
+val_size = int(len(df) * 0.16)
 
-# 从 PyTorch Tensor 转成 NumPy 数组
 train_indices = indices[:train_size].numpy()
-test_indices = indices[train_size:].numpy()
+val_indices = indices[train_size:train_size + val_size].numpy()
+test_indices = indices[train_size + val_size:].numpy()
 
-# 根据下标划分，并使用 copy() 避免 SettingWithCopyWarning
 X_train = X.iloc[train_indices].copy()
+X_val = X.iloc[val_indices].copy()
 X_test = X.iloc[test_indices].copy()
 
 y_train = y.iloc[train_indices].copy()
+y_val = y.iloc[val_indices].copy()
 y_test = y.iloc[test_indices].copy()
 
-# 6.处理缺失值
+print()
+print("数据集划分完成：")
+print(f"训练集：{len(X_train)} 条")
+print(f"验证集：{len(X_val)} 条")
+print(f"测试集：{len(X_test)} 条")
 
-# 年龄：使用训练集的中位数
+# 6. 缺失值处理
+
 age_median = X_train["Age"].median()
 
 X_train["Age"] = X_train["Age"].fillna(age_median)
+X_val["Age"] = X_val["Age"].fillna(age_median)
 X_test["Age"] = X_test["Age"].fillna(age_median)
 
-# Embarked：使用训练集的众数
 embarked_mode = X_train["Embarked"].mode()[0]
 
 X_train["Embarked"] = X_train["Embarked"].fillna(embarked_mode)
+X_val["Embarked"] = X_val["Embarked"].fillna(embarked_mode)
 X_test["Embarked"] = X_test["Embarked"].fillna(embarked_mode)
 
-# 7.删除暂时不使用的字段
+# 7. 删除不直接使用的原始字段
 
-drop_columns = ["PassengerId", "Name", "Ticket", "Cabin"]
+drop_columns = [
+    "PassengerId",
+    "Name",
+    "Ticket",
+    "Cabin"
+]
 
 X_train = X_train.drop(columns=drop_columns)
+X_val = X_val.drop(columns=drop_columns)
 X_test = X_test.drop(columns=drop_columns)
 
-# 8.独热编码
+# 8. 类别特征处理
 
-# 确定分类变量
-categorical_features = ["Sex", "Embarked", "Deck", "Title"]
+categorical_features = [
+    "Sex",
+    "Embarked",
+    "Deck",
+    "Title"
+]
 
-# 保存每个分类变量的类别
 category_maps = {}
 
 for col in categorical_features:
 
-    # 只根据训练集确定类别
+    # 只能使用训练集确定有哪些类别
     categories = X_train[col].dropna().unique().tolist()
 
     category_maps[col] = categories
 
-    # 测试集中没有见过的类别设为空
+    # 验证集出现训练集中没有的类别时，设为空
+    X_val.loc[
+        ~X_val[col].isin(categories),
+        col
+    ] = None
+
+    # 测试集出现训练集中没有的类别时，设为空
     X_test.loc[
         ~X_test[col].isin(categories),
         col
     ] = None
 
+    # 使用训练集确定的类别范围
     X_train[col] = pd.Categorical(
         X_train[col],
+        categories=categories
+    )
+
+    X_val[col] = pd.Categorical(
+        X_val[col],
         categories=categories
     )
 
@@ -111,9 +148,16 @@ for col in categorical_features:
         categories=categories
     )
 
-# 独热编码
+# 9. One-Hot 独热编码
+
 X_train = pd.get_dummies(
     X_train,
+    columns=categorical_features,
+    dtype=int
+)
+
+X_val = pd.get_dummies(
+    X_val,
     columns=categorical_features,
     dtype=int
 )
@@ -124,13 +168,22 @@ X_test = pd.get_dummies(
     dtype=int
 )
 
-# 保证测试集和训练集拥有完全相同的特征
+# 保证验证集和测试集的特征列
+# 与训练集完全一致
+X_val = X_val.reindex(
+    columns=X_train.columns,
+    fill_value=0
+)
+
 X_test = X_test.reindex(
     columns=X_train.columns,
     fill_value=0
 )
 
-# 9.标准化数值特征
+# 10. 数值特征标准化
+
+# 均值和标准差只使用训练集计算。
+# 验证集和测试集使用训练集的参数。
 
 numeric_features = [
     "Pclass",
@@ -143,27 +196,33 @@ numeric_features = [
     "FarePerPerson"
 ]
 
-# 只使用训练集计算平均值和标准差
 train_mean = X_train[numeric_features].mean()
 train_std = X_train[numeric_features].std()
 
-# 防止某一列标准差为0
+# 如果某一列标准差为 0，避免除以 0
 train_std = train_std.replace(0, 1)
 
-# 训练集标准化
 X_train[numeric_features] = (
     X_train[numeric_features] - train_mean
 ) / train_std
 
-# 测试集使用训练集得到的参数
+X_val[numeric_features] = (
+    X_val[numeric_features] - train_mean
+) / train_std
+
 X_test[numeric_features] = (
     X_test[numeric_features] - train_mean
 ) / train_std
 
-# 10.转换成 PyTorch Tensor
+# 11. 转换成 PyTorch Tensor
 
 X_train_tensor = torch.tensor(
     X_train.values,
+    dtype=torch.float32
+)
+
+X_val_tensor = torch.tensor(
+    X_val.values,
     dtype=torch.float32
 )
 
@@ -172,9 +231,13 @@ X_test_tensor = torch.tensor(
     dtype=torch.float32
 )
 
-# 把标签调整成 (N, 1) 的形状
 y_train_tensor = torch.tensor(
     y_train.values,
+    dtype=torch.float32
+).reshape(-1, 1)
+
+y_val_tensor = torch.tensor(
+    y_val.values,
     dtype=torch.float32
 ).reshape(-1, 1)
 
@@ -183,11 +246,19 @@ y_test_tensor = torch.tensor(
     dtype=torch.float32
 ).reshape(-1, 1)
 
-# 11.创建 Dataset 和 DataLoader
+print()
+print(f"模型输入特征数量：{X_train.shape[1]}")
+
+# 12. 创建 Dataset 和 DataLoader
 
 train_dataset = TensorDataset(
     X_train_tensor,
     y_train_tensor
+)
+
+val_dataset = TensorDataset(
+    X_val_tensor,
+    y_val_tensor
 )
 
 test_dataset = TensorDataset(
@@ -195,10 +266,17 @@ test_dataset = TensorDataset(
     y_test_tensor
 )
 
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=32,
     shuffle=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=32,
+    shuffle=False
 )
 
 test_loader = DataLoader(
@@ -207,29 +285,34 @@ test_loader = DataLoader(
     shuffle=False
 )
 
-# 12.定义神经网络
+# 13. 定义神经网络
 
 class TitanicClassifier(nn.Module):
-    def __init__(self,input_size):
+
+    def __init__(self, input_size):
+
         super().__init__()
 
         self.network = nn.Sequential(
             nn.Linear(input_size, 16),
             nn.ReLU(),
+
             nn.Linear(16, 8),
             nn.ReLU(),
+
             nn.Linear(8, 1)
         )
 
     def forward(self, x):
+
         return self.network(x)
 
-# 根据实际处理后的特征数量确定输入层大小
+
 input_size = X_train.shape[1]
 
 model = TitanicClassifier(input_size)
 
-# 13.定义损失函数和优化器
+# 14. 定义损失函数和优化器
 
 criterion = nn.BCEWithLogitsLoss()
 
@@ -238,43 +321,61 @@ optimizer = torch.optim.Adam(
     lr=0.001
 )
 
-preprocessing_info = {
-    "age_median": age_median,
-    "embarked_mode": embarked_mode,
-    "train_mean": train_mean.to_dict(),
-    "train_std": train_std.to_dict(),
-    "feature_columns": X_train.columns.tolist(),
-    "categorical_features": categorical_features,
-    "category_maps": category_maps
-}
+# 15. 训练参数
 
-# 14.开始训练
-
-# 设置训练轮数
 epochs = 100
 
-# 记录训练过程中的损失和准确率
-loss_history = []
-accuracy_history = []
-test_accuracy_history = []
-
-best_test_accuracy = 0.0
-best_epoch = 0
-
-# 连续多少轮没有提高就停止
 patience = 20
 
-# 记录已经连续多少轮没有提高
+best_val_accuracy = 0.0
+
 no_improve_count = 0
+
+loss_history = []
+
+train_accuracy_history = []
+
+val_accuracy_history = []
+
+# 16. 定义评估函数
+
+# 这里专门负责计算准确率。
+def evaluate_accuracy(model, data_loader):
+
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+
+        for X_batch, y_batch in data_loader:
+
+            outputs = model(X_batch)
+
+            probabilities = torch.sigmoid(outputs)
+
+            predictions = (
+                probabilities >= 0.5
+            ).float()
+
+            correct += (
+                predictions == y_batch
+            ).sum().item()
+
+            total += y_batch.size(0)
+
+    return correct / total
+
+# 17. 开始训练
 
 for epoch in range(epochs):
 
-    # 训练
+    # 训练阶段
+
     model.train()
 
     total_loss = 0.0
-    correct = 0
-    total = 0
 
     for X_batch, y_batch in train_loader:
 
@@ -282,9 +383,12 @@ for epoch in range(epochs):
         outputs = model(X_batch)
 
         # 计算损失
-        loss = criterion(outputs, y_batch)
+        loss = criterion(
+            outputs,
+            y_batch
+        )
 
-        # 梯度清零
+        # 清空之前的梯度
         optimizer.zero_grad()
 
         # 反向传播
@@ -293,97 +397,174 @@ for epoch in range(epochs):
         # 更新参数
         optimizer.step()
 
-        # 记录损失
         total_loss += loss.item()
 
-        # 计算准确率
-        probabilities = torch.sigmoid(outputs)
-        predictions = (probabilities >= 0.5).float()
 
-        correct += (predictions == y_batch).sum().item()
-        total += y_batch.size(0)
-
-    train_loss = total_loss / len(train_loader)
-    train_accuracy = correct / total
+    # 计算本轮平均训练损失
+    train_loss = (
+        total_loss / len(train_loader)
+    )
 
     loss_history.append(train_loss)
-    accuracy_history.append(train_accuracy)
 
-    # 测试
-    model.eval()
+    # 训练集准确率
+    
+    train_accuracy = evaluate_accuracy(
+        model,
+        train_loader
+    )
 
-    test_correct = 0
-    test_total = 0
+    train_accuracy_history.append(
+        train_accuracy
+    )
 
-    with torch.no_grad():
+    # 验证集准确率
 
-        for X_batch, y_batch in test_loader:
+    val_accuracy = evaluate_accuracy(
+        model,
+        val_loader
+    )
 
-            outputs = model(X_batch)
+    val_accuracy_history.append(
+        val_accuracy
+    )
 
-            probabilities = torch.sigmoid(outputs)
 
-            predictions = (probabilities >= 0.5).float()
+    print(
+        f"第 {epoch + 1:03d} 轮 | "
+        f"Loss: {train_loss:.4f} | "
+        f"训练准确率: {train_accuracy:.2%} | "
+        f"验证准确率: {val_accuracy:.2%}"
+    )
 
-            test_correct += (predictions == y_batch).sum().item()
-            test_total += y_batch.size(0)
+    # 根据验证集选择最佳模型
 
-    test_accuracy = test_correct / test_total
-    test_accuracy_history.append(test_accuracy)
+    if val_accuracy > best_val_accuracy:
 
-    # 保存测试集表现最好的模型
-    if test_accuracy > best_test_accuracy:
+        best_val_accuracy = val_accuracy
 
-        # 更新最高准确率及最佳轮数
-        best_epoch = epoch + 1
-        best_test_accuracy = test_accuracy
-
-        # 因为有提高，所以重新计数
         no_improve_count = 0
 
         print(
             f"发现新的最佳模型！"
-            f"第 {epoch + 1} 轮，"
-            f"测试准确率：{test_accuracy:.2%}"
+            f"验证准确率：{val_accuracy:.2%}"
         )
 
+        # 保存预处理信息
+        preprocessing_info = {
+
+            "age_median": age_median,
+
+            "embarked_mode": embarked_mode,
+
+            "train_mean": train_mean.to_dict(),
+
+            "train_std": train_std.to_dict(),
+
+            "feature_columns": X_train.columns.tolist(),
+
+            "categorical_features": categorical_features,
+
+            "category_maps": category_maps
+        }
+
+        # 保存模型
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
-                "input_size": X_train.shape[1],
-                "preprocessing": preprocessing_info,
-                "best_test_accuracy": best_test_accuracy
+                "model_state_dict":
+                    model.state_dict(),
+
+                "input_size":
+                    X_train.shape[1],
+
+                "preprocessing":
+                    preprocessing_info,
+
+                "best_val_accuracy":
+                    best_val_accuracy
             },
-            "titanic_model_best.pth"
+            MODEL_PATH
         )
 
+
     else:
-        # 测试准确率没有提高
+
         no_improve_count += 1
+
+    # 早停
 
     if no_improve_count >= patience:
 
         print()
-        print(f"已经连续 {patience} 轮测试准确率没有提高，提前停止训练。")
-        print(f"当前训练轮数：{epoch + 1}")
-        print(f"目前最高测试准确率：{best_test_accuracy:.2%}")
+
+        print(
+            f"已经连续 {patience} 轮"
+            f"验证集准确率没有提高，"
+            f"提前停止训练。"
+        )
+
+        print(
+            f"当前训练轮数：{epoch + 1}"
+        )
+
+        print(
+            f"目前最高验证集准确率："
+            f"{best_val_accuracy:.2%}"
+        )
 
         break
 
+# 18. 训练结束
+
 print()
+
 print("训练完成！")
-print(f"测试集最高准确率: {best_test_accuracy:.2%}")
-print(f"最佳模型出现在第 {best_epoch} 轮")
-print("最好的模型已经保存为:titanic_model_best.pth")
 
-# 15.绘制训练过程曲线
+print(
+    f"验证集最高准确率："
+    f"{best_val_accuracy:.2%}"
+)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DOCS_DIR = BASE_DIR / "docs"
+print(
+    f"最佳模型已经保存到："
+    f"{MODEL_PATH}"
+)
 
-DOCS_DIR.mkdir(exist_ok=True)
+# 19. 重新加载验证集上表现最好的模型
 
-# 图1：模型损失趋势图
+checkpoint = torch.load(
+    MODEL_PATH,
+    weights_only=False
+)
+
+best_model = TitanicClassifier(
+    checkpoint["input_size"]
+)
+
+best_model.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+best_model.eval()
+
+
+print()
+print("最佳模型重新加载成功！")
+
+# 20. 最终测试
+
+final_test_accuracy = evaluate_accuracy(
+    best_model,
+    test_loader
+)
+
+print()
+print(
+    f"最终测试集准确率："
+    f"{final_test_accuracy:.2%}"
+)
+
+# 21. 绘制 Loss 曲线
 
 plt.figure(figsize=(8, 5))
 
@@ -395,60 +576,82 @@ plt.plot(
 
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
+
 plt.title("Training Loss Trend")
+
 plt.legend()
+
 plt.grid(True)
 
-# 自动调整布局
 plt.tight_layout()
 
-plt.savefig(DOCS_DIR / "loss_curve.png", dpi=300)
+plt.savefig(
+    DOCS_DIR / "loss_curve.png",
+    dpi=300
+)
 
 plt.show()
 
-# 图2：训练集和测试集准确率
+# 22. 绘制训练集和验证集准确率曲线
 
 plt.figure(figsize=(8, 5))
 
 plt.plot(
-    range(1, len(accuracy_history) + 1),
-    accuracy_history,
+    range(1, len(train_accuracy_history) + 1),
+    train_accuracy_history,
     label="Training Accuracy"
 )
 
 plt.plot(
-    range(1, len(test_accuracy_history) + 1),
-    test_accuracy_history,
-    label="Test Accuracy"
+    range(1, len(val_accuracy_history) + 1),
+    val_accuracy_history,
+    label="Validation Accuracy"
 )
 
 plt.xlabel("Epoch")
 plt.ylabel("Accuracy")
-plt.title("Training and Test Accuracy")
+
+plt.title(
+    "Training and Validation Accuracy"
+)
+
 plt.legend()
+
 plt.grid(True)
 
 plt.tight_layout()
 
-plt.savefig(DOCS_DIR / "accuracy_curve.png", dpi=300)
+plt.savefig(
+    DOCS_DIR / "accuracy_curve.png",
+    dpi=300
+)
 
 plt.show()
 
-# 16.重新加载模型
+# 23. 最终信息
 
-checkpoint = torch.load(
-    "titanic_model_best.pth",
-    weights_only=False
+print()
+print("项目训练完成")
+print(
+    f"最佳验证集准确率："
+    f"{best_val_accuracy:.2%}"
 )
 
-loaded_model = TitanicClassifier(
-    checkpoint["input_size"]
+print(
+    f"最终测试集准确率："
+    f"{final_test_accuracy:.2%}"
 )
 
-loaded_model.load_state_dict(
-    checkpoint["model_state_dict"]
+print(
+    f"模型文件：{MODEL_PATH}"
 )
 
-loaded_model.eval()
+print(
+    f"Loss 曲线："
+    f"{DOCS_DIR / 'loss_curve.png'}"
+)
 
-print("模型重新加载成功！")
+print(
+    f"准确率曲线："
+    f"{DOCS_DIR / 'accuracy_curve.png'}"
+)
